@@ -10,34 +10,24 @@ using namespace std;
 double pi = 3.141592653589793;
 
 int radius = 1;
-float v0 = 1;
-float dt = 0.01;
-int steps = 10000;
-int N = 500;
-double phi = 0.5; 
-double L = sqrt(N * pi * radius * radius / phi);
-int Pe = 10; //Peclet number 
-double Dr = v0 / (radius * Pe);
+double v0 = 1.0; // Self-propulsion speed
+double dt = 0.01; // Time step
+double k = 100.0; // mobility* Spring constant for repulsive force
 
 
 struct Particle {
     int id;
     std::array<double, 2> position; 
-    std::array<double, 2> velocity; 
-    std::array<double, 2> force;
-    double theta;                    // orientation angle
-    std::array<double, 2> n;         // orientation vector
+    std::array<double, 2> position_unwrapped; //actual dist travelled without pbc
+    std::array<double, 2> force; // (fx,fy)
+    double theta;                   // orientation angle
+    std::array<double, 2> n;        // orientation vector
 
 };
 
-struct Box{
-    double phi ; //Area fraction
-    int N; //number of particles
-    double L; //box length
-};
 
 struct Neighbor {
-    int id;                     // index of neighbor
+    int id;                    // index of neighbor
     std::array<double, 2> dr;  // {dx, dy}
     double r2;                 // squared distance
 };
@@ -46,7 +36,9 @@ class System
 {
 public:
 
-    System(Box& box) : _box{box}, _numparticles{0} { } //constructor initialiser list
+    System(int N, double L, double Pe) : _numparticles(N), L(L), Pe(Pe) {
+        _particles.resize(N);
+    } //constructor initialiser list
 
     std::vector<Particle>& get_particles() { 
         return _particles; 
@@ -56,46 +48,70 @@ public:
     std::vector<std::vector<Neighbor>> neighbors;       // r < rc
     std::vector<std::vector<Neighbor>> skin_neighbors;  // r < rc + r_skin
 
-
     void build_neighbor_lists_full();
     void build_neighbor_lists_core();
     double max_displacement() const;
+    
+    void initialize_particles(
+    const std::vector<std::array<double,2>>& positions,
+    const std::vector<double>& thetas) 
+    {
+
+        for (int i = 0; i < _numparticles; ++i) {
+            _particles[i].position_unwrapped = positions[i];
+            _particles[i].position = positions[i];
+            _particles[i].theta = thetas[i];
+
+            _particles[i].n[0] = std::cos(thetas[i]);
+            _particles[i].n[1] = std::sin(thetas[i]);
+
+        }
+    }
+
 
     inline void apply_pbc(std::array<double,2>& r) const { // apply periodic boundary conditions
-        r[0] -= _box.L * std::floor(r[0] / _box.L);
-        r[1] -= _box.L * std::floor(r[1] / _box.L);
+        r[0] -= L * std::floor(r[0] / L);
+        r[1] -= L * std::floor(r[1] / L);
     }
-
-    inline void set_cutoffs(double rc, double rskin) {
-        r_c = rc;
-        r_skin = rskin;
-    }
-
-    inline double get_r_skin() const {
-        return r_skin;
-    }
-
-private:
-
-    Box& _box;                           // Simulation box
-    std::vector<Particle> _particles;    // Standard library vector containing all particles
-    int _numparticles;                   // Total number of particles in the system
-    std::vector<std::array<double,2>> old_positions; //updated when skin neighbors are rebuilt
-    double r_c;
-    double r_skin;
-    std::vector<std::array<double,2>> forces;
 
     inline double min_image(double dx) const{   //minimum image convention
-        if (dx >  0.5 * _box.L) dx -= _box.L;
-        if (dx < -0.5 * _box.L) dx += _box.L;
+        if (dx >  0.5 * L) dx -= L;
+        if (dx < -0.5 * L) dx += L;
         return dx;
     }
+
+    inline void set_cutoff(){ 
+        r_c = 2*radius;
+        r_skin = 0.5*radius; }
+
+    inline double get_r_skin() const { return r_skin; }
+
+    inline void set_Dr(){
+        Dr = 1.0 / Pe; 
+    }
+    inline double get_Dr() const {
+        return Dr;
+    }
+
+
+    bool neighbors_initialized = false;
+
+private:
+    std::vector<Particle> _particles;    // Standard library vector containing all particles
+    double L;
+    int _numparticles;                   // Total number of particles in the system
+    double r_c; // cutoff radius
+    double r_skin; // skin thickness
+    std::vector<std::array<double,2>> old_positions; //updated when skin neighbors are rebuilt
+    double Pe; // Peclet number
+    double Dr; // rotational diffusion constant
+    
 };
 
 void System::build_neighbor_lists_full()
 {
-    const int N = _particles.size();
-    _numparticles = N;
+    set_cutoff();
+    const int N = size();
 
     neighbors.assign(N, {});  // clear previous neighbor lists
     skin_neighbors.assign(N, {});
@@ -142,6 +158,7 @@ void System::build_neighbor_lists_full()
 
 void System::build_neighbor_lists_core()
 {
+    set_cutoff();
     const double rc2 = r_c * r_c;
 
     neighbors.assign(_numparticles, {});
@@ -180,35 +197,82 @@ double System::max_displacement() const{
 }
 
 
-
 class evolver{
 
 private:
+
     System& _system;
     std::mt19937 rng;
     std::normal_distribution<double> normal;
 
-
 public:
+
     evolver(System& system): _system{system}, rng(1234), normal(0.0, 1.0) {} //constructor initialiser list
 
-    void step_euler(){
+    void compute_forces() {
         auto& particles = _system.get_particles();
+
+        // reset forces 
+        for (auto& p : particles) {
+            p.force[0] = 0.0;
+            p.force[1] = 0.0;
+        }
+
+        for (int i = 0; i < _system.size(); ++i) {
+            for (const auto& nb : _system.neighbors[i]) {
+
+                int j = nb.id;
+                if (j <= i) continue;  // avoid double counting
+
+                double dx = nb.dr[0];
+                double dy = nb.dr[1];
+                double r2 = nb.r2;
+
+                if (r2 < (2.0 * radius) * (2.0 * radius)) {
+                    double r = std::sqrt(r2) + 1e-12; // to avoid division by zero
+                    double f = k * (2.0 * radius - r) / r;
+
+                    particles[i].force[0] -= f * dx;
+                    particles[i].force[1] -= f * dy;
+
+                    particles[j].force[0] += f * dx;
+                    particles[j].force[1] += f * dy;
+                }
+            }
+        }
+    }
+
+
+    void step_euler(){
+        compute_forces();
+        auto& particles = _system.get_particles();
+        _system.set_Dr();
         for(auto& p : particles){
 
-            p.theta += std::sqrt(2.0 * Dr * dt) * normal(rng);
+            p.theta += std::sqrt(2.0 * _system.get_Dr()* dt) * normal(rng);
 
             // orientation vector
             p.n[0] = std::cos(p.theta);
             p.n[1] = std::sin(p.theta);
-            p.position[0] += p.velocity[0] * dt;
-            p.position[1] += p.velocity[1] * dt;
+
+            p.position_unwrapped[0] += (v0*(p.n[0]) + p.force[0])* dt;
+            p.position_unwrapped[1] += (v0*(p.n[1]) + p.force[1])* dt;
+            p.position[0] += (v0*(p.n[0]) + p.force[0])* dt;
+            p.position[1] += (v0*(p.n[1]) + p.force[1])* dt;
             _system.apply_pbc(p.position);
+            
         }
     }
 
     void update_neighbors(){
-        if(_system.max_displacement() > _system.get_r_skin() / 2.0){
+
+        if (!_system.neighbors_initialized) {
+            _system.build_neighbor_lists_full();
+            _system.neighbors_initialized = true;
+            return;
+        
+        }   
+        if(_system.max_displacement() > _system.get_r_skin()/2.0){
             _system.build_neighbor_lists_full();
         }
         else{
@@ -217,14 +281,9 @@ public:
     }
 
     void step() {
+        update_neighbors();
         step_euler();       
-        update_neighbors(); 
-        // later:
-        // compute_forces();
-        // apply_forces();
     }
-
-    
 
 };
 
@@ -234,11 +293,17 @@ namespace py = pybind11;
 PYBIND11_MODULE(abp_sim, m) {
     py::class_<Particle>(m, "Particle")
         .def_readwrite("position", &Particle::position)
+        .def_readwrite("position_unwrapped", &Particle::position_unwrapped)
         .def_readwrite("theta", &Particle::theta);
 
     py::class_<System>(m, "System")
-        .def("get_particles", &System::get_particles);
+    .def(py::init<int, double>())
+    .def("initialize_particles", &System::initialize_particles)
+    .def("get_particles", &System::get_particles,
+         py::return_value_policy::reference_internal);
 
     py::class_<evolver>(m, "Evolver")
-        .def("step", &evolver::step);
+    .def(py::init<System&>())
+    .def("step", &evolver::step);
+
 }
