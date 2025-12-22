@@ -13,10 +13,12 @@ int radius = 1;
 double v0 = 1.0; // Self-propulsion speed
 double dt = 0.01; // Time step
 double k = 100.0; // mobility* Spring constant for repulsive force
+double r_cluster = 2.4 * radius; 
 
 
 struct Particle {
     int id;
+    int cluster_num;
     std::array<double, 2> position; 
     std::array<double, 2> position_unwrapped; //actual dist travelled without pbc
     std::array<double, 2> force; // (fx,fy)
@@ -47,10 +49,11 @@ public:
     
     std::vector<std::vector<Neighbor>> neighbors;       // r < rc
     std::vector<std::vector<Neighbor>> skin_neighbors;  // r < rc + r_skin
-
+    std ::vector<int> cluster_sizes; // to store cluster sizes
     void build_neighbor_lists_full();
     void build_neighbor_lists_core();
     double max_displacement() const;
+    void find_clusters();
     
     void initialize_particles(
     const std::vector<std::array<double,2>>& positions,
@@ -196,6 +199,49 @@ double System::max_displacement() const{
     return std::sqrt(max2);
 }
 
+void System::find_clusters() {
+    const int N = size();
+    cluster_sizes.clear();
+
+    std::vector<bool> visited(N, false);
+    int cluster_id = 0;
+
+    for (int i = 0; i < N; ++i) {
+        if (visited[i]) continue;
+
+        // Start BFS for a new cluster
+        int cluster_size = 0;
+        std::vector<int> queue;
+        queue.push_back(i);
+        visited[i] = true;
+
+        _particles[i].cluster_num = cluster_id;
+
+        while (!queue.empty()) {
+            int p = queue.back();
+            queue.pop_back();
+            cluster_size++;
+
+            for (const auto& nb : neighbors[p]) {
+                int j = nb.id;
+
+                if (visited[j]) continue;
+
+                // distance check for cluster
+                if (nb.r2 < r_cluster * r_cluster) {
+                    visited[j] = true;
+                    _particles[j].cluster_num = cluster_id;
+                    queue.push_back(j);
+                }
+            }
+        }
+
+        cluster_sizes.push_back(cluster_size);
+        cluster_id++;
+    }
+}
+
+
 
 class evolver{
 
@@ -290,7 +336,7 @@ public:
 
 namespace py = pybind11;
 
-PYBIND11_MODULE(abp_sim, m) {
+PYBIND11_MODULE(clustered_abp_sim, m) {
     py::class_<Particle>(m, "Particle")
         .def_readwrite("position", &Particle::position)
         .def_readwrite("position_unwrapped", &Particle::position_unwrapped)
@@ -300,7 +346,9 @@ PYBIND11_MODULE(abp_sim, m) {
     .def(py::init<int, double, double>())
     .def("initialize_particles", &System::initialize_particles)
     .def("get_particles", &System::get_particles,
-         py::return_value_policy::reference_internal);
+         py::return_value_policy::reference_internal)
+    .def("find_clusters", &System::find_clusters)
+    .def_readonly("cluster_sizes", &System::cluster_sizes);
 
     py::class_<evolver>(m, "Evolver")
     .def(py::init<System&>())
